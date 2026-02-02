@@ -5,42 +5,8 @@ import { connectMongoDB } from '../config/database.js';
 import { ActivityLog } from '../config/types/index';
 import { kafkaMessagesConsumedTotal } from '../utils/metrics';
 
-const BATCH_SIZE = 100;
-const BATCH_TIMEOUT = 1000; // 1 second
-
-let messageBatch: ActivityLog[] = [];
-let batchTimer: NodeJS.Timeout | null = null;
-
-async function processBatch() {
-  if (messageBatch.length === 0) return;
-
-  const collection = getLogsCollection();
-  const logsToInsert = [...messageBatch];
-  messageBatch = [];
-
-  try {
-    await collection.insertMany(logsToInsert);
-    kafkaMessagesConsumedTotal.inc(logsToInsert.length);
-    logger.info(`Batch processed: ${logsToInsert.length} logs`);
-  } catch (error) {
-    logger.error('Error processing batch:', error);
-    // In production, implement dead letter queue
-  }
-}
-
-function scheduleBatchProcessing() {
-  if (batchTimer) {
-    clearTimeout(batchTimer);
-  }
-
-  batchTimer = setTimeout(async () => {
-    await processBatch();
-  }, BATCH_TIMEOUT);
-}
-
 async function startConsumer() {
   try {
-    // Connect to MongoDB first
     await connectMongoDB();
     logger.info('Consumer: MongoDB connected');
 
@@ -51,35 +17,51 @@ async function startConsumer() {
     logger.info('Starting Kafka consumer...');
 
     await consumer.run({
-      autoCommit: true,
-      autoCommitInterval: 5000,
-      eachBatch: async ({ batch, resolveOffset, heartbeat }) => {
+      autoCommit: false, // We will manually resolve offsets
+      eachBatchAutoResolve: false, 
+      eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, commitOffsetsIfNecessary }) => {
+        logger.info(`Received batch with ${batch.messages.length} messages`);
+        
+        const logsToInsert: ActivityLog[] = [];
+        
         for (const message of batch.messages) {
-          if (!message.value) continue;
+           if (!isRunning() || !message.value) continue;
 
+           try {
+             const raw = JSON.parse(message.value.toString());
+             
+             const log: ActivityLog = {
+               ...raw,
+               timestamp: new Date(raw.timestamp),
+               createdAt: raw.createdAt ? new Date(raw.createdAt) : new Date(),
+             };
+             
+             logsToInsert.push(log);
+           } catch (err) {
+             logger.error('Failed to parse message', err);
+             // Verify if we should skip or retry. For now, we skip bad messages but mark offset resolved
+           }
+
+           // Mark this message as processed (conceptually) - though we commit in bulk at end
+           resolveOffset(message.offset);
+        }
+
+        if (logsToInsert.length > 0) {
           try {
-            const raw = JSON.parse(message.value.toString());
-
-            const log: ActivityLog = {
-                ...raw,
-                timestamp: new Date(raw.timestamp),
-                createdAt: raw.createdAt ? new Date(raw.createdAt) : new Date(),
-            };
-            messageBatch.push(log);
-
-            // Process batch if it reaches the size limit
-            if (messageBatch.length >= BATCH_SIZE) {
-              await processBatch();
-            } else {
-              scheduleBatchProcessing();
-            }
-
-            await resolveOffset(message.offset);
-            await heartbeat();
+            const collection = getLogsCollection();
+            await collection.insertMany(logsToInsert);
+            kafkaMessagesConsumedTotal.inc(logsToInsert.length);
+            logger.info(`Processed ${logsToInsert.length} logs from Kafka batch`);
           } catch (error) {
-            logger.error('Error processing message:', error);
+            logger.error('Error inserting batch into MongoDB:', error);
+            // In a real scenario, you might throw here to retry the batch
+            // or dead letter queue the batch.
+            throw error; 
           }
         }
+
+        await heartbeat();
+        await commitOffsetsIfNecessary();
       },
     });
 
@@ -92,16 +74,12 @@ async function startConsumer() {
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, processing remaining messages...');
-  if (batchTimer) clearTimeout(batchTimer);
-  await processBatch();
+  logger.info('SIGTERM received');
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  logger.info('SIGINT received, processing remaining messages...');
-  if (batchTimer) clearTimeout(batchTimer);
-  await processBatch();
+  logger.info('SIGINT received');
   process.exit(0);
 });
 

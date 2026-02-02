@@ -6,6 +6,19 @@ let kafka: Kafka;
 let producer: Producer;
 let consumer: Consumer;
 
+// Batching configuration
+const BATCH_SIZE = 100;
+const FLUSH_INTERVAL = 1000; // 1 second
+
+interface BufferedMessage {
+  key: string;
+  value: string;
+  timestamp: string;
+}
+
+let messageBuffer: BufferedMessage[] = [];
+let flushTimer: NodeJS.Timeout | null = null;
+
 export async function initKafkaProducer(): Promise<void> {
   try {
     kafka = new Kafka({
@@ -74,26 +87,57 @@ export function getConsumer(): Consumer {
   return consumer;
 }
 
-export async function produceMessage(message: any): Promise<void> {
+async function flushBuffer(): Promise<void> {
+  if (messageBuffer.length === 0) return;
+
+  const messagesToSend = [...messageBuffer];
+  messageBuffer = [];
+
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+
   try {
     await producer.send({
       topic: config.kafka.topic,
-      messages: [
-        {
-          key: message.userId || message.service,
-          value: JSON.stringify(message),
-          timestamp: Date.now().toString(),
-        },
-      ],
+      messages: messagesToSend,
     });
+    // logger.info(`Flushed ${messagesToSend.length} messages to Kafka`);
   } catch (error) {
-    logger.error('Error producing message to Kafka:', error);
-    throw error;
+    logger.error('Error flushing messages to Kafka:', error);
+    // In a real app, you might want to retry or persist these failed messages
+  }
+}
+
+export async function produceMessage(message: any): Promise<void> {
+  // Add to buffer
+  messageBuffer.push({
+    key: message.userId || message.service,
+    value: JSON.stringify(message),
+    timestamp: Date.now().toString(),
+  });
+
+  // Flush if batch size reached
+  if (messageBuffer.length >= BATCH_SIZE) {
+    // We don't await this because we want to return immediately 
+    flushBuffer().catch(err => logger.error('Async flush failed', err));
+  } else if (!flushTimer) {
+    // Schedule flush if not already scheduled
+    flushTimer = setTimeout(() => {
+      flushBuffer().catch(err => logger.error('Scheduled flush failed', err));
+    }, FLUSH_INTERVAL);
   }
 }
 
 export async function closeKafka(): Promise<void> {
   try {
+    // Flush any remaining messages
+    if (messageBuffer.length > 0) {
+      logger.info('Flushing remaining messages before shutdown...');
+      await flushBuffer();
+    }
+
     if (producer) {
       await producer.disconnect();
       logger.info('Kafka producer disconnected');
