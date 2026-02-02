@@ -5,7 +5,7 @@ yarn-error.log
 
 # TypeScript
 *.tsbuildinfo
-
+target
 # Logs
 uploads
 logs
@@ -14,7 +14,7 @@ logs/*
 dist
 # Dependency directories
 jspm_packages/
-
+.vs
 # Optional npm cache directory
 .npm
 firebase-service-account.json
